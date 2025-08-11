@@ -528,7 +528,6 @@ def main():
         print("Aborted by user.", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
-        log = logging.getLogger("yt_subber")
         log.error(f"Error: {e}")
         sys.exit(1)
 
