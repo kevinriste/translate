@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import yt_dlp
 from openai import OpenAI
 from tqdm import tqdm
 
@@ -52,15 +53,6 @@ def run(
         raise RuntimeError(
             f"Command failed: {' '.join(shlex.quote(c) for c in cmd)}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         ) from e
-
-
-def have_tool(name: str) -> bool:
-    return (
-        subprocess.run(
-            ["which", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        ).returncode
-        == 0
-    )
 
 
 def is_youtube_url(s: str) -> bool:
@@ -329,28 +321,56 @@ def whisper_request(
 
 
 def download_youtube(url: str, workdir: Path) -> Path:
-    if not have_tool("yt-dlp"):
-        raise RuntimeError("yt-dlp not found on PATH but a YouTube URL was provided.")
+    """
+    Download the video using yt-dlp's Python API. Returns the downloaded file path.
+    """
     # Download best mp4/mkv as single file, write to workdir
-    out_tpl = str(workdir / "%(title)s [%(id)s].%(ext)s")
-    cmd = ["yt-dlp", "-f", "bv*+ba/b", "-o", out_tpl, "--no-playlist", url]
-    print("Downloading with yt-dlp (this may take a while)...")
-    run(cmd, check=True)
-    # Find the newest media file
-    candidates = sorted(
-        workdir.glob("*.*"), key=lambda p: p.stat().st_mtime, reverse=True
-    )
-    vids = [
-        p
-        for p in candidates
-        if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
-    ]
-    if not vids:
-        raise RuntimeError("yt-dlp finished but no video file found.")
-    return vids[0]
+    workdir.mkdir(parents=True, exist_ok=True)
+    outtmpl = str(workdir / "%(title)s [%(id)s].%(ext)s")
+
+    ydl_opts = {
+        "format": "bv*+ba/b",
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        # Uncomment to see more detail:
+        # "verbose": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        vid_id = info.get("id")
+        # Find the downloaded file by id to be robust against remux/merge
+        candidates = sorted(
+            workdir.glob(f"*[{vid_id}].*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        vids = [
+            p
+            for p in candidates
+            if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+        ]
+        if not vids:
+            # Fallback: scan all recent files
+            recent = sorted(
+                workdir.glob("*.*"), key=lambda p: p.stat().st_mtime, reverse=True
+            )
+            vids = [
+                p
+                for p in recent
+                if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+            ]
+        if not vids:
+            raise RuntimeError("yt-dlp finished but no video file found.")
+        return vids[0]
 
 
 def ensure_video(input_arg: str, workdir: Path) -> Path:
+    """
+    If URL: download via yt-dlp library; else resolve local file.
+    """
     if is_youtube_url(input_arg):
         return download_youtube(input_arg, workdir)
     p = Path(input_arg).expanduser().resolve()
@@ -365,25 +385,34 @@ def existing_sidecar_srt(video_path: Path) -> Optional[Path]:
 
 
 def try_yt_subs(url: str, workdir: Path) -> Optional[Path]:
-    if not have_tool("yt-dlp"):
-        raise RuntimeError(
-            "yt-dlp not found on PATH but required for subtitle download."
-        )
-    cmd = [
-        "yt-dlp",
-        "--write-subs",
-        "--write-auto-subs",
-        "--sub-lang",
-        "en",
-        "--convert-subs",
-        "srt",
-        "--skip-download",
-        "-o",
-        str(workdir / "%(title)s [%(id)s].%(ext)s"),
-        url,
-    ]
-    run(cmd, check=True)
-    # pick newest .en.srt
+    """
+    Attempt to download English subtitles only (official or auto) and convert to SRT.
+    Returns the .en.srt path if created, else None.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    outtmpl = str(workdir / "%(title)s [%(id)s].%(ext)s")
+
+    ydl_opts = {
+        "writesubtitles": True,  # official subs
+        "writeautomaticsub": False,  # auto-generated subs
+        "subtitleslangs": ["en-US"],
+        "skip_download": True,
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegSubtitlesConvertor",
+                "format": "srt",
+            }
+        ],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # download=False still processes metadata; writes subs due to writesubtitles+skip_download
+        ydl.extract_info(url, download=False)
+
+    # pick newest .en.srt produced
     srts = sorted(
         workdir.glob("*.en.srt"), key=lambda p: p.stat().st_mtime, reverse=True
     )

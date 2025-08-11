@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+*.ytdl
+*.part
+*.srt
+*.webm

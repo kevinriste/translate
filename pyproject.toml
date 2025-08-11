@@ -7,4 +7,5 @@ requires-python = ">=3.10"
 dependencies = [
     "openai>=1.99.7",
     "tqdm>=4.67.1",
+    "yt-dlp>=2025.8.11",
 ]
