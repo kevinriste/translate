@@ -34,18 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from openai import OpenAI
 from tqdm import tqdm
-
-# Try to import the modern OpenAI SDK; fallback to legacy if needed.
-OPENAI_SDK_MODE = None
-try:
-    from openai import OpenAI  # type: ignore
-
-    OPENAI_SDK_MODE = "v1"
-except Exception:
-    OPENAI_SDK_MODE = None
-
-# --------------------------- Utilities ---------------------------
 
 
 def run(
@@ -79,9 +69,6 @@ def is_youtube_url(s: str) -> bool:
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|\s]+', "_", name).strip("_")
-
-
-# --------------------------- ffmpeg helpers ---------------------------
 
 
 def ffprobe_streams(video_path: Path) -> List[dict]:
@@ -133,8 +120,6 @@ def extract_embedded_english_subs(video_path: Path, out_srt: Path) -> bool:
         return True
     return False
 
-
-# --------------------------- Audio prep & chunking ---------------------------
 
 BITRATE_BPS = 64_000  # 64 kbps CBR
 SPLIT_TARGET_MB = 24.0  # keep a margin below 25 MB
@@ -194,9 +179,6 @@ def split_audio_to_chunks(audio_path: Path, out_dir: Path) -> List[Path]:
     if not chunks:
         raise RuntimeError("Audio splitting produced no chunks.")
     return chunks
-
-
-# --------------------------- Minimal SRT parser/serializer ---------------------------
 
 
 @dataclass
@@ -299,17 +281,8 @@ def offset_entries(entries: List[SRTEntry], offset_ms: int) -> List[SRTEntry]:
     return out
 
 
-# --------------------------- Whisper API ---------------------------
-
-
 def openai_client():
-    if OPENAI_SDK_MODE == "v1":
-        return OpenAI()
-    else:
-        # Fall back to raw HTTP via requests if the SDK isn't available
-        import requests  # lazy import
-
-        return None
+    return OpenAI()
 
 
 def whisper_request(file_path: Path, translate: bool, prompt: Optional[str]) -> str:
@@ -320,57 +293,31 @@ def whisper_request(file_path: Path, translate: bool, prompt: Optional[str]) -> 
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set in environment.")
     client = openai_client()
-    if OPENAI_SDK_MODE == "v1":
-        with file_path.open("rb") as f:
-            if translate:
-                # English translation from source language
-                resp = client.audio.translations.create(
-                    model="whisper-1",
-                    file=f,
-                    response_format="srt",
-                    prompt=prompt or None,
-                )
-            else:
-                # Transcription in source language
-                resp = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    response_format="srt",
-                    prompt=prompt or None,
-                )
-        # SDK returns a str for srt formats
-        if isinstance(resp, str):
-            return resp
-        # Some SDK versions wrap it
-        try:
-            return resp.text  # type: ignore[attr-defined]
-        except Exception:
-            return str(resp)
-    else:
-        # Lightweight fallback (requests)
-        import requests
-
-        url = "https://api.openai.com/v1/audio/" + (
-            "translations" if translate else "transcriptions"
-        )
-        headers = {"Authorization": f"Bearer {api_key}"}
-        with file_path.open("rb") as f:
-            files = {
-                "file": (file_path.name, f, "audio/mpeg"),
-            }
-            data = {
-                "model": "whisper-1",
-                "response_format": "srt",
-            }
-            if prompt:
-                data["prompt"] = prompt
-            r = requests.post(url, headers=headers, data=data, files=files, timeout=600)
-            if r.status_code != 200:
-                raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
-            return r.text
-
-
-# --------------------------- Core workflow ---------------------------
+    with file_path.open("rb") as f:
+        if translate:
+            # English translation from source language
+            resp = client.audio.translations.create(
+                model="whisper-1",
+                file=f,
+                response_format="srt",
+                prompt=prompt or None,
+            )
+        else:
+            # Transcription in source language
+            resp = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="srt",
+                prompt=prompt or None,
+            )
+    # SDK returns a str for srt formats
+    if isinstance(resp, str):
+        return resp
+    # Some SDK versions wrap it
+    try:
+        return resp.text  # type: ignore[attr-defined]
+    except Exception:
+        return str(resp)
 
 
 def download_youtube(url: str, workdir: Path) -> Path:
