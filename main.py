@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import re
 import shlex
@@ -37,6 +38,13 @@ from typing import List, Optional, Tuple
 import yt_dlp
 from openai import OpenAI
 from tqdm import tqdm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("yt_subber")
 
 
 def run(
@@ -334,37 +342,27 @@ def download_youtube(url: str, workdir: Path) -> Path:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # Uncomment to see more detail:
-        # "verbose": True,
+        # Pull English subs (official or auto) alongside the video:
+        "writesubtitles": True,
+        "writeautomaticsub": False,
+        # accept en and region variants (en-US, en-GB, …)
+        "subtitleslangs": ["en", "en.*"],
+        # request SRT; if source is VTT/TTML, convert to SRT
+        "subtitlesformat": "srt",
+        "postprocessors": [
+            {"key": "FFmpegSubtitlesConvertor", "format": "srt"},
+        ],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        vid_id = info.get("id")
-        # Find the downloaded file by id to be robust against remux/merge
-        candidates = sorted(
-            workdir.glob(f"*[{vid_id}].*"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
+
+    video_path = Path(info.get("filepath") or ydl.prepare_filename(info)).resolve()
+    if not video_path.exists():
+        raise RuntimeError(
+            "yt-dlp reported no output file (filepath/prepare_filename not found on disk)."
         )
-        vids = [
-            p
-            for p in candidates
-            if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
-        ]
-        if not vids:
-            # Fallback: scan all recent files
-            recent = sorted(
-                workdir.glob("*.*"), key=lambda p: p.stat().st_mtime, reverse=True
-            )
-            vids = [
-                p
-                for p in recent
-                if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
-            ]
-        if not vids:
-            raise RuntimeError("yt-dlp finished but no video file found.")
-        return vids[0]
+    return video_path
 
 
 def ensure_video(input_arg: str, workdir: Path) -> Path:
@@ -380,43 +378,20 @@ def ensure_video(input_arg: str, workdir: Path) -> Path:
 
 
 def existing_sidecar_srt(video_path: Path) -> Optional[Path]:
-    candidate = video_path.with_suffix(".en.srt")
-    return candidate if candidate.exists() and candidate.stat().st_size > 0 else None
-
-
-def try_yt_subs(url: str, workdir: Path) -> Optional[Path]:
-    """
-    Attempt to download English subtitles only (official or auto) and convert to SRT.
-    Returns the .en.srt path if created, else None.
-    """
-    workdir.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(workdir / "%(title)s [%(id)s].%(ext)s")
-
-    ydl_opts = {
-        "writesubtitles": True,  # official subs
-        "writeautomaticsub": False,  # auto-generated subs
-        "subtitleslangs": ["en-US"],
-        "skip_download": True,
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "no_warnings": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegSubtitlesConvertor",
-                "format": "srt",
-            }
-        ],
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        # download=False still processes metadata; writes subs due to writesubtitles+skip_download
-        ydl.extract_info(url, download=False)
-
-    # pick newest .en.srt produced
-    srts = sorted(
-        workdir.glob("*.en.srt"), key=lambda p: p.stat().st_mtime, reverse=True
+    exact = video_path.with_suffix(".en.srt")
+    if exact.exists() and exact.stat().st_size > 0:
+        return exact
+    # accept en-XX / en_XX sidecars and normalize to .en.srt
+    stem = video_path.with_suffix("").name
+    parent = video_path.parent
+    matches = sorted(
+        parent.glob(f"{stem}.en*.srt"), key=lambda p: p.stat().st_mtime, reverse=True
     )
-    return srts[0] if srts else None
+    if matches:
+        tmp = matches[0]
+        tmp.replace(exact) if not exact.exists() else None
+        return exact if exact.exists() else tmp
+    return None
 
 
 def transcribe_via_whisper(
@@ -436,8 +411,8 @@ def transcribe_via_whisper(
 
         combined_entries: List[SRTEntry] = []
         offset_ms_total = 0
-        pbar = tqdm(total=len(chunks), desc="Transcribing", unit="chunk")
-        try:
+
+        with tqdm(total=len(chunks), desc="Transcribing", unit="chunk") as pbar:
             for idx, ch in enumerate(chunks, start=1):
                 srt_text = whisper_request(
                     ch,
@@ -446,12 +421,7 @@ def transcribe_via_whisper(
                     retries=retries,
                 )
                 # Parse -> offset -> append
-                try:
-                    entries = parse_srt(srt_text)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Failed to parse SRT from chunk {idx}: {e}"
-                    ) from e
+                entries = parse_srt(srt_text)  # let it raise; top-level catches
                 # Estimate chunk duration for offset: get from ffprobe (accurate) to avoid CBR assumptions
                 dur_ms = probe_duration_ms(ch)
                 shifted = offset_entries(entries, offset_ms_total)
@@ -460,18 +430,13 @@ def transcribe_via_whisper(
                 pbar.update(1)
                 # Small nap to be nice to rate limits on some accounts
                 time.sleep(0.2)
-        finally:
-            pbar.close()
 
         # Validate & write
         ok, msg = validate_srt(combined_entries)
         if not ok:
             # Write a debug file alongside to help diagnose (but not final .en.srt)
-            debug_path = out_srt.with_suffix(".en.invalid.srt")
-            debug_path.write_text(serialize_srt(combined_entries), encoding="utf-8")
-            raise RuntimeError(
-                f"SRT validation failed: {msg}. Wrote debug to {debug_path.name}"
-            )
+
+            log.error(f"SRT validation failed: {msg}. Still wrote subtitles file.")
         out_srt.write_text(serialize_srt(combined_entries), encoding="utf-8")
 
 
@@ -520,14 +485,6 @@ def main():
     args = parser.parse_args()
 
     # Basic logging to STDERR with timestamps
-    import logging
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    log = logging.getLogger("yt_subber")
 
     try:
         workdir = Path(args.workdir).expanduser().resolve() if args.workdir else None
@@ -538,15 +495,6 @@ def main():
             workdir = video_path.parent
 
         log.info(f"Video: {video_path}")
-
-        # If this is a YouTube URL, try grabbing .en.srt before anything else
-        if is_youtube_url(args.input):
-            log.info("Trying to download YouTube subtitles...")
-            yt_srt = try_yt_subs(args.input, workdir)
-            if yt_srt:
-                log.info(f"Downloaded YouTube subtitles -> {yt_srt.name}")
-                print(str(yt_srt))
-                return
 
         # Step 1: If sidecar exists, done.
         sidecar = existing_sidecar_srt(video_path)
