@@ -285,7 +285,9 @@ def openai_client():
     return OpenAI()
 
 
-def whisper_request(file_path: Path, translate: bool, prompt: Optional[str]) -> str:
+def whisper_request(
+    file_path: Path, translate: bool, prompt: Optional[str], retries: int
+) -> str:
     """
     Returns the SRT text for the given audio chunk.
     """
@@ -293,31 +295,37 @@ def whisper_request(file_path: Path, translate: bool, prompt: Optional[str]) -> 
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set in environment.")
     client = openai_client()
-    with file_path.open("rb") as f:
-        if translate:
-            # English translation from source language
-            resp = client.audio.translations.create(
-                model="whisper-1",
-                file=f,
-                response_format="srt",
-                prompt=prompt or None,
-            )
-        else:
-            # Transcription in source language
-            resp = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="srt",
-                prompt=prompt or None,
-            )
-    # SDK returns a str for srt formats
-    if isinstance(resp, str):
-        return resp
-    # Some SDK versions wrap it
-    try:
-        return resp.text  # type: ignore[attr-defined]
-    except Exception:
-        return str(resp)
+    attempt = 0
+    while True:
+        try:
+            with file_path.open("rb") as f:
+                if translate:
+                    # English translation from source language
+                    resp = client.audio.translations.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="srt",
+                        prompt=prompt or None,
+                    )
+                else:
+                    # Transcription in source language
+                    resp = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="srt",
+                        prompt=prompt or None,
+                    )
+                return (
+                    resp if isinstance(resp, str) else getattr(resp, "text", str(resp))
+                )
+        except Exception as e:
+            attempt += 1
+            if attempt > retries:
+                raise e
+            import random
+            import time as _t
+
+            _t.sleep(min(2**attempt, 10) + random.random())
 
 
 def download_youtube(url: str, workdir: Path) -> Path:
@@ -356,8 +364,38 @@ def existing_sidecar_srt(video_path: Path) -> Optional[Path]:
     return candidate if candidate.exists() and candidate.stat().st_size > 0 else None
 
 
+def try_yt_subs(url: str, workdir: Path) -> Optional[Path]:
+    if not have_tool("yt-dlp"):
+        raise RuntimeError(
+            "yt-dlp not found on PATH but required for subtitle download."
+        )
+    cmd = [
+        "yt-dlp",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-lang",
+        "en",
+        "--convert-subs",
+        "srt",
+        "--skip-download",
+        "-o",
+        str(workdir / "%(title)s [%(id)s].%(ext)s"),
+        url,
+    ]
+    run(cmd, check=True)
+    # pick newest .en.srt
+    srts = sorted(
+        workdir.glob("*.en.srt"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    return srts[0] if srts else None
+
+
 def transcribe_via_whisper(
-    video_path: Path, out_srt: Path, translate_default: bool, user_prompt: Optional[str]
+    video_path: Path,
+    out_srt: Path,
+    translate_default: bool,
+    user_prompt: Optional[str],
+    retries: int,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="ytw_") as tmpd:
         tmpdir = Path(tmpd)
@@ -373,7 +411,10 @@ def transcribe_via_whisper(
         try:
             for idx, ch in enumerate(chunks, start=1):
                 srt_text = whisper_request(
-                    ch, translate=translate_default, prompt=user_prompt
+                    ch,
+                    translate=translate_default,
+                    prompt=user_prompt,
+                    retries=retries,
                 )
                 # Parse -> offset -> append
                 try:
@@ -446,6 +487,7 @@ def main():
         default=None,
         help="Working directory (for yt-dlp downloads). Defaults to the video's folder.",
     )
+    parser.add_argument("--retries", type=int, default=3, help="API retry attempts")
     args = parser.parse_args()
 
     # Basic logging to STDERR with timestamps
@@ -467,6 +509,15 @@ def main():
             workdir = video_path.parent
 
         log.info(f"Video: {video_path}")
+
+        # If this is a YouTube URL, try grabbing .en.srt before anything else
+        if is_youtube_url(args.input):
+            log.info("Trying to download YouTube subtitles...")
+            yt_srt = try_yt_subs(args.input, workdir)
+            if yt_srt:
+                log.info(f"Downloaded YouTube subtitles -> {yt_srt.name}")
+                print(str(yt_srt))
+                return
 
         # Step 1: If sidecar exists, done.
         sidecar = existing_sidecar_srt(video_path)
@@ -491,6 +542,7 @@ def main():
             out_srt,
             translate_default=(not args.transcribe),
             user_prompt=args.prompt,
+            retries=args.retries,
         )
         log.info(f"Wrote {out_srt.name}")
         print(str(out_srt))
