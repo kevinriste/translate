@@ -370,6 +370,7 @@ def ensure_video(input_arg: str, workdir: Path) -> Path:
     If URL: download via yt-dlp library; else resolve local file.
     """
     if is_youtube_url(input_arg):
+        log.info("YouTube URL provided, starting download...")
         return download_youtube(input_arg, workdir)
     p = Path(input_arg).expanduser().resolve()
     if not p.exists():
@@ -500,7 +501,6 @@ def main():
         sidecar = existing_sidecar_srt(video_path)
         if sidecar:
             log.info(f"Found existing sidecar: {sidecar.name}. Nothing to do.")
-            print(str(sidecar))
             return
 
         # Step 2: Try extracting embedded English subs.
@@ -508,7 +508,6 @@ def main():
         log.info("Checking for embedded English subtitles...")
         if extract_embedded_english_subs(video_path, out_srt):
             log.info(f"Extracted embedded English subtitles -> {out_srt.name}")
-            print(str(out_srt))
             return
 
         # Step 3: Generate with Whisper.
@@ -522,7 +521,6 @@ def main():
             retries=args.retries,
         )
         log.info(f"Wrote {out_srt.name}")
-        print(str(out_srt))
 
     except KeyboardInterrupt:
         print("Aborted by user.", file=sys.stderr)
