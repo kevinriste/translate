@@ -2,7 +2,7 @@
 """
 yt_subber.py
 -------------
-Given a file path OR a YouTube URL:
+Given a file path OR a video URL:
 - If URL: download with yt-dlp.
 - Then: check for English subtitles:
    * Use sibling "<video>.en.srt" if present, else
@@ -18,7 +18,7 @@ Python: tqdm, requests (if openai package not available), but we use openai>=1.0
 Environment: export OPENAI_API_KEY=...
 
 Usage:
-  python yt_subber.py "<path-or-youtube-url>" [--transcribe] [--prompt "style or terms"] [--workdir /tmp]
+  python yt_subber.py "<path-or-video-url>" [--transcribe] [--prompt "style or terms"] [--workdir /tmp]
 """
 
 import argparse
@@ -63,8 +63,8 @@ def run(
         ) from e
 
 
-def is_youtube_url(s: str) -> bool:
-    return bool(re.match(r"^(https?://)?(www\.)?(youtube\.com|youtu\.be)/", s, re.I))
+def is_url(s: str) -> bool:
+    return bool(re.match(r"^(https?://)?([a-z0-9-]+\.)+[a-z]{2,}(/.*)?$", s, re.I))
 
 
 def sanitize_filename(name: str) -> str:
@@ -328,7 +328,7 @@ def whisper_request(
             _t.sleep(min(2**attempt, 10) + random.random())
 
 
-def download_youtube(url: str, workdir: Path) -> Path:
+def download_video(url: str, workdir: Path) -> Path:
     """
     Download the video using yt-dlp's Python API. Returns the downloaded file path.
     """
@@ -369,9 +369,9 @@ def ensure_video(input_arg: str, workdir: Path) -> Path:
     """
     If URL: download via yt-dlp library; else resolve local file.
     """
-    if is_youtube_url(input_arg):
-        log.info("YouTube URL provided, starting download...")
-        return download_youtube(input_arg, workdir)
+    if is_url(input_arg):
+        log.info("URL provided, starting download...")
+        return download_video(input_arg, workdir)
     p = Path(input_arg).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Input file not found: {p}")
@@ -464,7 +464,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download (optional), detect/extract subtitles, otherwise generate with Whisper API."
     )
-    parser.add_argument("input", help="Path to local video file OR YouTube URL")
+    parser.add_argument("input", help="Path to local video file OR video URL")
     parser.add_argument(
         "--transcribe",
         action="store_true",
