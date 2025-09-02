@@ -6,7 +6,7 @@ Given a file path OR a video URL:
 - If URL: download with yt-dlp.
 - Then: check for English subtitles:
    * Use sibling "<video>.en.srt" if present, else
-   * Extract embedded English subs with ffmpeg/ffprobe if present, else
+   * Check for embedded English subs with ffmpeg/ffprobe if present, else
    * Use OpenAI Whisper API to generate SRT (translate by default; --transcribe to keep source language)
 - Audio is extracted as MP3 (mono, 16kHz, 64 kbps CBR) then split into <25MB chunks.
 - Chunks are sent sequentially to Whisper (`whisper-1`) with response_format="srt", optional --prompt.
@@ -87,7 +87,7 @@ def ffprobe_streams(video_path: Path) -> List[dict]:
     return data.get("streams", [])
 
 
-def extract_embedded_english_subs(video_path: Path, out_srt: Path) -> bool:
+def check_for_embedded_english_subs(video_path: Path, out_srt: Path) -> bool:
     streams = ffprobe_streams(video_path)
     subs = []
     for s in streams:
@@ -100,25 +100,7 @@ def extract_embedded_english_subs(video_path: Path, out_srt: Path) -> bool:
     if not subs:
         return False
 
-    # Map first English subtitle stream; transcode to SRT if needed
-    stream_index = subs[0]
-    tmp_srt = out_srt.with_suffix(".tmp.en.srt")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(video_path),
-        "-map",
-        f"0:{stream_index}",
-        "-c:s",
-        "srt",
-        str(tmp_srt),
-    ]
-    run(cmd, check=True, capture_output=True)
-    if tmp_srt.exists() and tmp_srt.stat().st_size > 0:
-        tmp_srt.replace(out_srt)
-        return True
-    return False
+    return True
 
 
 BITRATE_BPS = 64_000  # 64 kbps CBR
@@ -506,8 +488,8 @@ def main():
         # Step 2: Try extracting embedded English subs.
         out_srt = video_path.with_suffix(".en.srt")
         log.info("Checking for embedded English subtitles...")
-        if extract_embedded_english_subs(video_path, out_srt):
-            log.info(f"Extracted embedded English subtitles -> {out_srt.name}")
+        if check_for_embedded_english_subs(video_path, out_srt):
+            log.info("Video file already includes English subtitles")
             return
 
         # Step 3: Generate with Whisper.
